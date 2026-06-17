@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import io
 import os
 import glob
 import random
@@ -11,12 +12,12 @@ import sys
 import internetarchive as ia
 import cv2
 import numpy as np
-import yaml
 
 from colorthief import ColorThief
 from mutagen.mp3 import MP3
 from PIL import Image, ImageDraw, ImageOps
-from twython import Twython
+
+IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff')
 
 def get_items_list():
     with open('georgeblood.txt', 'r') as f:
@@ -43,7 +44,7 @@ def get_label_circle(fullsize_path):
     ratio = fullsize_dimensions[0]/640
 
     crop = ImageOps.fit(fullsize, (640,640))
-    filename = ''.join(['640_' + fullsize_path])
+    filename = ''.join(['640_' + os.path.basename(fullsize_path)])
     crop.save(filename)
 
     src = cv2.imread(filename)
@@ -72,12 +73,37 @@ def crop_label(imagepath, x, y, r):
 
     return label_crop
 
+def get_label_crop(image_path, quiet=False):
+    """Locate the round record label in an image and return a square crop of it.
+
+    If no circular label can be detected (common for arbitrary user-supplied
+    images), fall back to a centered square crop of the whole image so the
+    spinning effect still works instead of failing."""
+    try:
+        circle = get_label_circle(image_path)
+    except Exception:
+        circle = None
+
+    if circle is not None:
+        x, y, r = circle
+        return crop_label(image_path, x, y, r)
+
+    if not quiet:
+        print("  no record label detected; spinning the full image")
+    img = Image.open(image_path).convert('RGB')
+    side = min(img.size)
+    return ImageOps.fit(img, (side, side))
+
 def get_color(image, cleanup=True):
-    image.save('label.jpg')
-    colorthief = ColorThief('label.jpg')
-    if cleanup:
-        os.remove('label.jpg')
+    # Feed ColorThief an in-memory buffer rather than a temp file on disk.
+    # ColorThief holds the file handle open, which on Windows prevents the
+    # temp file from being deleted (PermissionError / WinError 32).
+    buf = io.BytesIO()
+    image.convert('RGB').save(buf, format='JPEG')
+    buf.seek(0)
+    colorthief = ColorThief(buf)
     palette = colorthief.get_palette(color_count=2, quality=1)
+    buf.close()
     for color in palette:
         if not all(channel < 64 for channel in color):
             dominant = color
@@ -144,25 +170,41 @@ def render_video(image_directory, audio_file, max_time=140, output_file='merge.m
 
     subprocess.run(command)
 
-def post_tweet(status, video_file):
-    with open('config.yaml') as f:
-        config = yaml.safe_load(f)
+def make_video(audio_path, image_path, output_file, maxlength=140, rpm=12.5,
+               cleanup=True, quiet=False):
+    """Render a spinning-record video from a local audio file and image."""
+    if os.path.exists('temp'):
+        shutil.rmtree('temp')
+    os.makedirs('temp')
 
-    twitter_app_key = config['twitter_app_key']
-    twitter_app_secret = config['twitter_app_secret']
-    twitter_oauth_token = config['twitter_oauth_token']
-    twitter_oauth_token_secret = config['twitter_oauth_token_secret']
+    if not quiet:
+        print("finding label")
+    label_crop = get_label_crop(image_path, quiet=quiet)
+    bg_color = get_color(label_crop, cleanup)
 
-    twitter = Twython(twitter_app_key, twitter_app_secret, twitter_oauth_token, twitter_oauth_token_secret)
+    seconds_per_rotation = 60/rpm
+    frames_per_rotation = seconds_per_rotation * 25
+    degrees_per_frame = max(1, int(360/frames_per_rotation))
 
-    with open(video_file, 'rb') as f:
-        response = twitter.upload_video(media=f, media_type='video/mp4',
-                                        media_category='tweet_video', check_progress = True)
+    if not quiet:
+        print("rendering spinning record frames")
+    render_record_frames(label_crop, bg_color,
+                         degrees_per_frame=degrees_per_frame, max_time=maxlength)
 
-    twitter.update_status(status=status, media_ids=[response['media_id']])
+    if not quiet:
+        print("rendering video")
+    render_video('temp', audio_path, max_time=maxlength, output_file=output_file)
+
+    if cleanup and os.path.exists('temp'):
+        shutil.rmtree('temp')
+
+    if not quiet:
+        print("saved", output_file)
 
 
-def run(ia_id=None, cleanup=True, to_tweet=True, quiet=False, maxlength=140, rpm=78):
+def run_ia(ia_id=None, cleanup=True, quiet=False, maxlength=140, rpm=12.5,
+           output_file=None):
+    """Pull a record from the Internet Archive (Great 78 Project) and render it."""
     if ia_id is None:
         items = get_items_list()
         ia_id = get_item(items)
@@ -190,81 +232,161 @@ def run(ia_id=None, cleanup=True, to_tweet=True, quiet=False, maxlength=140, rpm
     track.download(track.name)
     photo.download(photo.name)
 
-    if os.path.exists('temp'):
-        shutil.rmtree('temp')
+    if output_file is None:
+        output_file = item.identifier + '.mp4'
 
-    os.makedirs('temp')
-
-    if not quiet:
-        print("finding label")
-    try:
-        center_x, center_y, radius = get_label_circle(photo.name)
-    except:
-        sys.exit('Unable to find label in item image.')
-
-    label_crop = crop_label(photo.name, center_x, center_y, radius)
-    bg_color = get_color(label_crop, cleanup)
-
-    seconds_per_rotation = 60/rpm
-    frames_per_rotation = seconds_per_rotation * 25
-    degrees_per_frame = int(360/frames_per_rotation)
-
-    if not quiet:
-        print("rendering spinning record frames")
-    render_record_frames(label_crop, bg_color, 
-                         degrees_per_frame=degrees_per_frame, max_time=maxlength)
-
-    if not quiet:
-        print("rendering video")
-    render_video('temp', track.name, max_time=maxlength)
+    make_video(track.name, photo.name, output_file,
+               maxlength=maxlength, rpm=rpm, cleanup=cleanup, quiet=quiet)
 
     if cleanup:
-        os.remove(track.name)
-        os.remove(photo.name)
+        if os.path.exists(track.name):
+            os.remove(track.name)
+        if os.path.exists(photo.name):
+            os.remove(photo.name)
 
-        shutil.rmtree('temp')
+    status = " ".join([title.lower() + ' - ' + str(artists).lower(), url])
+    print(status)
 
-    status = " ".join([title.lower() + ' - ' + artists.lower(), url])
 
-    if to_tweet:
-        post_tweet(status, video_file='merge.mp4')
+def run_local(audio_path, image_path, output_file=None, maxlength=140, rpm=12.5,
+              cleanup=True, quiet=False):
+    """Render a video from a single local mp3 + image."""
+    if not os.path.exists(audio_path):
+        sys.exit('audio file not found: ' + audio_path)
+    if not os.path.exists(image_path):
+        sys.exit('image file not found: ' + image_path)
+
+    if output_file is None:
+        stem = os.path.splitext(os.path.basename(audio_path))[0]
+        output_file = os.path.join(os.path.dirname(audio_path) or '.', stem + '.mp4')
+
+    make_video(audio_path, image_path, output_file,
+               maxlength=maxlength, rpm=rpm, cleanup=cleanup, quiet=quiet)
+
+
+def find_image_for(audio_path, default_image=None):
+    """Find an image sitting next to an mp3 with the same base name."""
+    stem = os.path.splitext(audio_path)[0]
+    for ext in IMAGE_EXTS:
+        for candidate in (stem + ext, stem + ext.upper()):
+            if os.path.exists(candidate):
+                return candidate
+    return default_image
+
+
+def run_batch(folder, default_image=None, outdir=None, maxlength=140, rpm=12.5,
+              cleanup=True, quiet=False):
+    """Render a video for every mp3 in a folder, pairing each with an image."""
+    if not os.path.isdir(folder):
+        sys.exit('not a folder: ' + folder)
+
+    # Collect mp3s, de-duplicating case-insensitively so we don't process a
+    # file twice on case-insensitive filesystems (e.g. Windows, where both
+    # '*.mp3' and '*.MP3' match the same files).
+    seen = set()
+    mp3s = []
+    for pattern in ('*.mp3', '*.MP3'):
+        for p in glob.glob(os.path.join(folder, pattern)):
+            key = os.path.normcase(os.path.abspath(p))
+            if key not in seen:
+                seen.add(key)
+                mp3s.append(p)
+    mp3s.sort()
+    if not mp3s:
+        sys.exit('no .mp3 files found in ' + folder)
+
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+
+    succeeded = 0
+    for audio_path in mp3s:
+        image_path = find_image_for(audio_path, default_image)
+        if image_path is None:
+            print('skipping (no matching image, and no --image fallback):', audio_path)
+            continue
+
+        stem = os.path.splitext(os.path.basename(audio_path))[0]
+        out = os.path.join(outdir or folder, stem + '.mp4')
+
         if not quiet:
-            print('tweet posted!')
-    else:
-        print(status)
+            print('processing', os.path.basename(audio_path), '->', out)
+        try:
+            make_video(audio_path, image_path, out,
+                       maxlength=maxlength, rpm=rpm, cleanup=cleanup, quiet=quiet)
+            succeeded += 1
+        except Exception as e:
+            print('  failed:', os.path.basename(audio_path), '-', e)
+
+    print('batch done: {}/{} rendered'.format(succeeded, len(mp3s)))
+
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Render spinning-record videos from the Internet Archive "
+                    "or from your own local mp3s and images.")
 
-    parser.add_argument('-k', '--keep', action='store_true',
-                        help="""keep intermediate files after completion""")
+    # Local single-file mode
+    parser.add_argument('-a', '--audio', action='store', default=None,
+                        help="path to a local mp3 to render (use with --image)")
+    parser.add_argument('-g', '--image', action='store', default=None,
+                        help="path to a local image; the record label/art to spin. "
+                             "In --batch mode, used as a fallback when no same-named "
+                             "image is found next to an mp3")
+
+    # Local batch mode
+    parser.add_argument('-b', '--batch', action='store', default=None,
+                        help="path to a folder of mp3s to render in bulk")
+    parser.add_argument('--outdir', action='store', default=None,
+                        help="folder to write batch output into (default: next to each mp3)")
+
+    # Internet Archive mode (default)
     parser.add_argument('-i', '--id', action='store', default=None,
-                        help="""explicitly provide an
-                        Internet Archive identifier for download""")
-    parser.add_argument('-d', '--dryrun', action='store_true',
-                        help="""download files and render video but
-                        do not tweet""")
+                        help="explicitly provide an Internet Archive identifier to download")
+
+    # Shared options
+    parser.add_argument('-o', '--output', action='store', default=None,
+                        help="output video path (single-file / IA modes)")
+    parser.add_argument('-k', '--keep', action='store_true',
+                        help="keep intermediate files after completion")
     parser.add_argument('-q', '--quiet', action='store_true',
-                        help="""suppress progress output""")
+                        help="suppress progress output")
     parser.add_argument('-m', '--maxlength', action='store', type=int, default=140,
-                        help="""set the max length of the video in seconds (default 140)""")
+                        help="max length of the video in seconds (default 140; 0 = full track)")
     parser.add_argument('-r', '--rpm', action='store', type=float, default=12.5,
-                        help="""set revolutions per minute of spinning disc""")
+                        help="revolutions per minute of the spinning disc (default 12.5)")
 
     args = parser.parse_args()
     cleanup = not args.keep
-    ia_id = args.id
-    to_tweet = not args.dryrun
-    quiet = args.quiet
-    maxlength = args.maxlength
-    rpm = args.rpm
+
+    # Resolve user-supplied paths to absolute *before* we chdir into the script
+    # directory (which is required so grooves/, shine/ and georgeblood.txt resolve).
+    def _abs(p):
+        return os.path.abspath(p) if p else p
+
+    audio = _abs(args.audio)
+    image = _abs(args.image)
+    batch = _abs(args.batch)
+    outdir = _abs(args.outdir)
+    output = _abs(args.output)
 
     abspath = os.path.abspath(__file__)
     dname = os.path.dirname(abspath)
     os.chdir(dname)
 
-    run(ia_id=ia_id, cleanup=cleanup, to_tweet=to_tweet,
-            quiet=quiet, maxlength=maxlength, rpm=rpm)
+    if batch:
+        run_batch(batch, default_image=image, outdir=outdir,
+                  maxlength=args.maxlength, rpm=args.rpm,
+                  cleanup=cleanup, quiet=args.quiet)
+    elif audio:
+        if not image:
+            sys.exit('--image is required when using --audio')
+        run_local(audio, image, output_file=output,
+                  maxlength=args.maxlength, rpm=args.rpm,
+                  cleanup=cleanup, quiet=args.quiet)
+    else:
+        run_ia(ia_id=args.id, cleanup=cleanup, quiet=args.quiet,
+               maxlength=args.maxlength, rpm=args.rpm, output_file=output)
+
 
 if __name__ == '__main__':
     main()
