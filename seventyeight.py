@@ -151,11 +151,20 @@ def render_record_frames(label_crop, bg_color, size=(720,720), degrees_per_frame
         index += 1
         angle += degrees_per_frame
 
-def render_video(image_directory, audio_file, max_time=140, output_file='merge.mp4'):
-    audio = MP3(audio_file)
+def get_audio_duration(audio_file):
+    """Return the duration of an audio file in seconds, for any format ffmpeg
+    can read (wav, mp3, flac, ...). Uses ffprobe so we aren't limited to mp3."""
+    result = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'default=noprint_wrappers=1:nokey=1', audio_file],
+        capture_output=True, text=True)
+    return float(result.stdout.strip())
 
-    if max_time == 0 or audio.info.length < max_time:
-        timeout = audio.info.length
+def render_video(image_directory, audio_file, max_time=140, output_file='merge.mp4'):
+    length = get_audio_duration(audio_file)
+
+    if max_time == 0 or length < max_time:
+        timeout = length
         fade = False
     else:
         timeout = max_time
