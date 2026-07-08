@@ -113,19 +113,26 @@ def get_color(image, cleanup=True):
 
     return dominant
 
-def render_record_frames(label_crop, bg_color, size=(720,720), degrees_per_frame=3,
-                         max_time=140, directory="temp"):
+def build_disc(label_crop, size=(720,720)):
+    """Composite a label crop onto a black record disc image."""
     label_crop = ImageOps.fit(label_crop, (400,400))
     label_mask = Image.new('L', (400,400))
-    draw = ImageDraw.Draw(label_mask)
-    draw.ellipse((0,0,400,400), fill=255)
+    ImageDraw.Draw(label_mask).ellipse((0,0,400,400), fill=255)
 
     recimg = Image.new('RGB', size, 0)
     recimg.paste(label_crop, box=(160,160), mask=label_mask)
+    return recimg
 
+def build_mat(size=(720,720)):
+    """Ring mask: everything outside the record circle gets the background color."""
     mat = Image.new('L', size, color=255)
-    draw = ImageDraw.Draw(mat)
-    draw.ellipse((36,36,684,684), fill=0)
+    ImageDraw.Draw(mat).ellipse((36,36,684,684), fill=0)
+    return mat
+
+def render_record_frames(label_crop, bg_color, size=(720,720), degrees_per_frame=3,
+                         max_time=140, directory="temp"):
+    recimg = build_disc(label_crop, size)
+    mat = build_mat(size)
 
     angle = 0
     index = 0
@@ -134,6 +141,38 @@ def render_record_frames(label_crop, bg_color, size=(720,720), degrees_per_frame
 
     while index <= 25 * max_time and (angle % 360 or angle == 0 or grooves or shines):
         rot = recimg.rotate(-angle)
+        rot.paste(bg_color, mask=mat)
+        if not grooves:
+            grooves = sorted(glob.glob('grooves/*'), reverse=True)
+        if not shines:
+            shines = sorted(glob.glob('shine/*'), reverse=True)
+
+        groove_mask = ImageOps.invert(Image.open(grooves.pop(0)).convert(mode='L'))
+        shine_mask = ImageOps.invert(Image.open(shines.pop(0)).convert(mode='L'))
+
+        rot.paste(bg_color, mask=groove_mask)
+        rot.paste(bg_color, mask=shine_mask)
+
+        filename = 'img{:04d}.jpg'.format(index)
+        rot.save(os.path.join(directory, filename))
+        index += 1
+        angle += degrees_per_frame
+
+def render_alternating_frames(label_crops, bg_color, size=(720,720),
+                              degrees_per_frame=3, max_time=140, directory="temp"):
+    """Like render_record_frames, but swap which label is on the disc every full
+    rotation, cycling through label_crops (back-and-forth for two images)."""
+    discs = [build_disc(lc, size) for lc in label_crops]
+    mat = build_mat(size)
+
+    angle = 0
+    index = 0
+    grooves = []
+    shines = []
+
+    while index <= 25 * max_time:
+        which = (angle // 360) % len(discs)
+        rot = discs[which].rotate(-angle)
         rot.paste(bg_color, mask=mat)
         if not grooves:
             grooves = sorted(glob.glob('grooves/*'), reverse=True)
@@ -209,6 +248,57 @@ def make_video(audio_path, image_path, output_file, maxlength=140, rpm=12.5,
 
     if not quiet:
         print("saved", output_file)
+
+
+def make_alternating_video(audio_path, image_paths, output_file, maxlength=140,
+                           rpm=12.5, cleanup=True, quiet=False):
+    """Render a spinning-record video whose label alternates between multiple
+    images, switching once per full rotation."""
+    if os.path.exists('temp'):
+        shutil.rmtree('temp')
+    os.makedirs('temp')
+
+    if not quiet:
+        print("finding labels")
+    label_crops = [get_label_crop(p, quiet=quiet) for p in image_paths]
+    bg_color = get_color(label_crops[0], cleanup)
+
+    seconds_per_rotation = 60/rpm
+    frames_per_rotation = seconds_per_rotation * 25
+    degrees_per_frame = max(1, int(360/frames_per_rotation))
+
+    if not quiet:
+        print("rendering alternating spinning frames "
+              "({:.1f}s per image)".format(seconds_per_rotation))
+    render_alternating_frames(label_crops, bg_color,
+                              degrees_per_frame=degrees_per_frame, max_time=maxlength)
+
+    if not quiet:
+        print("rendering video")
+    render_video('temp', audio_path, max_time=maxlength, output_file=output_file)
+
+    if cleanup and os.path.exists('temp'):
+        shutil.rmtree('temp')
+
+    if not quiet:
+        print("saved", output_file)
+
+
+def run_alternating(audio_path, image_paths, output_file=None, maxlength=140,
+                    rpm=12.5, cleanup=True, quiet=False):
+    """Render a single track whose label alternates between two or more images."""
+    if not os.path.exists(audio_path):
+        sys.exit('audio file not found: ' + audio_path)
+    for p in image_paths:
+        if not os.path.exists(p):
+            sys.exit('image file not found: ' + p)
+
+    if output_file is None:
+        stem = os.path.splitext(os.path.basename(audio_path))[0]
+        output_file = os.path.join(os.path.dirname(audio_path) or '.', stem + '_alt.mp4')
+
+    make_alternating_video(audio_path, image_paths, output_file,
+                           maxlength=maxlength, rpm=rpm, cleanup=cleanup, quiet=quiet)
 
 
 def run_ia(ia_id=None, cleanup=True, quiet=False, maxlength=140, rpm=12.5,
@@ -341,6 +431,9 @@ def main():
                         help="path to a local image; the record label/art to spin. "
                              "In --batch mode, used as a fallback when no same-named "
                              "image is found next to an mp3")
+    parser.add_argument('--images', nargs='+', default=None,
+                        help="two or more images to alternate between, one per spin "
+                             "(use with --audio)")
 
     # Local batch mode
     parser.add_argument('-b', '--batch', action='store', default=None,
@@ -374,6 +467,7 @@ def main():
 
     audio = _abs(args.audio)
     image = _abs(args.image)
+    images = [_abs(p) for p in args.images] if args.images else None
     batch = _abs(args.batch)
     outdir = _abs(args.outdir)
     output = _abs(args.output)
@@ -387,11 +481,16 @@ def main():
                   maxlength=args.maxlength, rpm=args.rpm,
                   cleanup=cleanup, quiet=args.quiet)
     elif audio:
-        if not image:
-            sys.exit('--image is required when using --audio')
-        run_local(audio, image, output_file=output,
-                  maxlength=args.maxlength, rpm=args.rpm,
-                  cleanup=cleanup, quiet=args.quiet)
+        if images and len(images) > 1:
+            run_alternating(audio, images, output_file=output,
+                            maxlength=args.maxlength, rpm=args.rpm,
+                            cleanup=cleanup, quiet=args.quiet)
+        elif image:
+            run_local(audio, image, output_file=output,
+                      maxlength=args.maxlength, rpm=args.rpm,
+                      cleanup=cleanup, quiet=args.quiet)
+        else:
+            sys.exit('provide --image (single) or --images img1 img2 ... (alternating) with --audio')
     else:
         run_ia(ia_id=args.id, cleanup=cleanup, quiet=args.quiet,
                maxlength=args.maxlength, rpm=args.rpm, output_file=output)
